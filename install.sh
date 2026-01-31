@@ -280,7 +280,8 @@ db_list_protocols() {
 # 获取所有已安装协议
 db_get_all_protocols() {
     [[ ! -f "$DB_FILE" ]] && return 1
-    { jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null; jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null; } | sort -u
+    # 使用 // {} 处理缺失的键，避免 jq 返回错误
+    jq -r '(.xray // {} | keys[]), (.singbox // {} | keys[])' "$DB_FILE" 2>/dev/null | sort -u
 }
 
 #═══════════════════════════════════════════════════════════════════════════════

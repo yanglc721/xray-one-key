@@ -2096,6 +2096,10 @@ register_protocol() {
     local port
     port=$(echo "$config_json" | jq -r '.port')
     
+    # 获取用户凭证（用于创建 default 用户）
+    local user_cred=""
+    user_cred=$(echo "$config_json" | jq -r '.uuid // .password // .psk // empty')
+    
     # 根据安装模式处理
     if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
         # 覆盖模式：更新指定端口的配置
@@ -2110,7 +2114,13 @@ register_protocol() {
         echo -e "  ${CYAN}添加新端口 $port 实例...${NC}"
         db_add_port "$core" "$protocol" "$config_json"
     else
-        # 首次安装：使用单对象格式
+        # 首次安装：使用单对象格式，并自动创建 default 用户
+        # 将 uuid/password/psk 作为 default 用户添加到 users 数组
+        if [[ -n "$user_cred" ]]; then
+            local created=$(date '+%Y-%m-%d')
+            config_json=$(echo "$config_json" | jq --arg u "$user_cred" --arg c "$created" \
+                '.users = [{name:"default",uuid:$u,quota:0,used:0,enabled:true,created:$c}]')
+        fi
         db_add "$core" "$protocol" "$config_json"
     fi
     

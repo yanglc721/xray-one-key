@@ -23051,6 +23051,9 @@ main_menu() {
         _header
         echo -e "  ${W}服务端管理${NC}"
 
+        # 调用 show_status 填充 _INSTALLED_CACHE
+        show_status >/dev/null 2>&1
+
         # 获取系统版本信息
         local os_version="$DISTRO"
         if [[ -f /etc/os-release ]]; then

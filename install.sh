@@ -258,6 +258,53 @@ db_update_port() {
     ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
 }
 
+# 检查端口是否已被使用（在数据库中）
+db_port_in_use() {
+    local port="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # 检查所有协议的端口
+    local result=$(jq --argjson port "$port" '
+        [.. | .port? | select(. == $port)] | length > 0
+    ' "$DB_FILE" 2>/dev/null)
+    
+    [[ "$result" == "true" ]]
+}
+
+# 添加用户并关联到指定端口（用于 ss-legacy 等不支持同端口多用户的协议）
+# 用法: db_add_user_with_port "xray" "ss-legacy" "用户名" "密码" "配额GB" "端口"
+db_add_user_with_port() {
+    local core="$1" proto="$2" name="$3" uuid="$4" quota_gb="${5:-0}" port="$6"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # 计算配额(字节)
+    local quota=0
+    if [[ "$quota_gb" -gt 0 ]]; then
+        quota=$((quota_gb * 1073741824))  # GB to bytes
+    fi
+    
+    local created=$(date '+%Y-%m-%d')
+    
+    # 添加用户到指定端口的配置中
+    local tmp_file="${DB_FILE}.tmp"
+    jq --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
+       --argjson q "$quota" --arg cr "$created" --argjson port "$port" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            # 找到对应端口的实例并添加用户
+            .[$c][$p] = [$cfg[] | if .port == $port then 
+                .users = ((.users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,port:$port}])
+            else . end]
+        else
+            # 单端口模式：添加用户并标记端口
+            .[$c][$p].users = ((.[$c][$p].users // []) + [{name:$n,uuid:$u,quota:$q,used:0,enabled:true,created:$cr,port:$port}])
+        end
+    ' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    
+    # 自动重建配置
+    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
+}
+
 # 删除协议
 db_del() { # db_del core proto
     _db_apply --arg p "$2" "del(.${1}[\$p])"
@@ -17476,6 +17523,10 @@ do_install_server() {
             # SS 传统版加密方式选择
             echo ""
             _line
+            echo -e "  ${Y}⚠ 注意: ss-legacy 不支持同端口多用户${NC}"
+            echo -e "  ${D}添加新用户时将自动分配新端口 (基准端口+1, +2, ...)${NC}"
+            _line
+            echo ""
             echo -e "  ${W}选择 Shadowsocks 加密方式${NC}"
             _line
             _item "1" "aes-256-gcm ${D}(推荐, 兼容性好)${NC}"
@@ -21640,6 +21691,20 @@ _gen_user_share_link() {
     local method=$(echo "$cfg" | jq -r '.method // empty')
     local domain=$(echo "$cfg" | jq -r '.domain // empty')
     
+    # ss-legacy 特殊处理：获取用户专属端口和密码
+    if [[ "$proto" == "ss-legacy" ]]; then
+        local full_cfg=$(db_get "$core" "$proto")
+        if echo "$full_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            # 多端口模式：查找用户所在的端口实例
+            local user_cfg=$(echo "$full_cfg" | jq -c --arg name "$user_name" \
+                '[.[] | select(.users[]?.name == $name)] | .[0] // empty')
+            if [[ -n "$user_cfg" && "$user_cfg" != "null" ]]; then
+                port=$(echo "$user_cfg" | jq -r '.port')
+                uuid=$(echo "$user_cfg" | jq -r '.password')
+            fi
+        fi
+    fi
+    
     # 获取 IP 地址
     local ipv4=$(get_ipv4)
     local ipv6=$(get_ipv6)
@@ -21686,6 +21751,7 @@ _gen_user_share_link() {
             vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
             vmess-ws) link=$(gen_vmess_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
             ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
+            ss-legacy) link=$(gen_ss_legacy_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
             hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
             trojan) link=$(gen_trojan_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
             tuic) 
@@ -21708,6 +21774,12 @@ _show_user_share_links() {
         echo -e "  ${W}$proto_name 用户分享链接${NC}"
         _dline
         
+        # ss-legacy 多端口提示
+        if [[ "$proto" == "ss-legacy" ]]; then
+            echo -e "  ${D}注意: ss-legacy 每用户使用独立端口${NC}"
+            echo ""
+        fi
+        
         local stats=$(db_get_users_stats "$core" "$proto")
         if [[ -z "$stats" ]]; then
             echo -e "  ${D}暂无用户${NC}"
@@ -21719,13 +21791,20 @@ _show_user_share_links() {
         # 显示用户列表
         local users=()
         local uuids=()
+        local ports=()
         local idx=1
         
         while IFS='|' read -r name uuid used quota enabled port routing; do
             [[ -z "$name" ]] && continue
             users+=("$name")
             uuids+=("$uuid")
-            echo -e "  ${G}$idx${NC}) $name"
+            ports+=("$port")
+            # ss-legacy 显示端口号
+            if [[ "$proto" == "ss-legacy" ]]; then
+                echo -e "  ${G}$idx${NC}) $name ${D}(端口: $port)${NC}"
+            else
+                echo -e "  ${G}$idx${NC}) $name"
+            fi
             ((idx++))
         done <<< "$stats"
         
@@ -21944,6 +22023,13 @@ _add_user() {
     echo -e "  ${W}添加用户 - $proto_name${NC}"
     _line
     
+    # ss-legacy 多用户警告
+    if [[ "$proto" == "ss-legacy" ]]; then
+        echo -e "  ${Y}⚠ 注意: ss-legacy 不支持同端口多用户${NC}"
+        echo -e "  ${D}每个用户将使用独立端口，新用户端口 = 基准端口 + 用户序号${NC}"
+        echo ""
+    fi
+    
     # 输入用户名
     local name
     while true; do
@@ -22009,6 +22095,47 @@ _add_user() {
     read -rp "  确认添加? [Y/n]: " confirm
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
+    # ss-legacy 特殊处理：每个用户使用独立端口
+    if [[ "$proto" == "ss-legacy" ]]; then
+        # 获取基准端口和已有用户数
+        local base_cfg=$(db_get "$core" "$proto")
+        local base_port=$(echo "$base_cfg" | jq -r 'if type == "array" then .[0].port else .port end')
+        local method=$(echo "$base_cfg" | jq -r 'if type == "array" then .[0].method else .method end')
+        local existing_users=$(db_list_users "$core" "$proto" 2>/dev/null | wc -l)
+        local new_port=$((base_port + existing_users))
+        
+        # 检查端口是否可用
+        while ss -tuln 2>/dev/null | grep -q ":${new_port} " || db_port_in_use "$new_port"; do
+            ((new_port++))
+            [[ $new_port -gt 65535 ]] && { _err "无可用端口"; return 1; }
+        done
+        
+        # 为该用户创建独立的端口实例
+        local user_config=$(jq -n --argjson port "$new_port" --arg method "$method" --arg password "$uuid" \
+            '{port: $port, method: $method, password: $password}')
+        
+        if db_add_port "$core" "$proto" "$user_config"; then
+            # 将用户信息绑定到该端口（通过 port 字段关联）
+            if db_add_user_with_port "$core" "$proto" "$name" "$uuid" "$quota_gb" "$new_port"; then
+                _ok "用户 $name 添加成功 (端口: $new_port)"
+                
+                if [[ -n "$user_routing" ]]; then
+                    db_set_user_routing "$core" "$proto" "$name" "$user_routing"
+                    _ok "路由配置: $routing_display"
+                fi
+                
+                _info "更新配置..."
+                _regenerate_config "$core" "$proto"
+                _ok "配置已更新"
+            else
+                _err "添加用户失败"
+            fi
+        else
+            _err "添加端口失败"
+        fi
+        return
+    fi
+    
     # 添加到数据库
     if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb"; then
         _ok "用户 $name 添加成功"
@@ -22064,6 +22191,21 @@ _delete_user() {
             # 确认删除
             read -rp "  确认删除用户 $name? [y/N]: " confirm
             [[ ! "$confirm" =~ ^[yY]$ ]] && return
+            
+            # ss-legacy 特殊处理：同时删除用户专属端口
+            if [[ "$proto" == "ss-legacy" ]]; then
+                # 获取用户的端口
+                local user_port=$(db_get_user_field "$core" "$proto" "$name" "port")
+                if [[ -n "$user_port" ]]; then
+                    # 删除该端口实例（如果不是基准端口）
+                    local base_cfg=$(db_get "$core" "$proto")
+                    local base_port=$(echo "$base_cfg" | jq -r 'if type == "array" then .[0].port else .port end')
+                    if [[ "$user_port" != "$base_port" ]]; then
+                        db_remove_port "$core" "$proto" "$user_port"
+                        _info "已删除端口 $user_port"
+                    fi
+                fi
+            fi
             
             if db_del_user "$core" "$proto" "$name"; then
                 _ok "用户 $name 已删除"
